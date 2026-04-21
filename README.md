@@ -85,6 +85,7 @@ python -m kws_doa.run
 
 ## FastAPI 예시 코드
 
+```
 from fastapi import FastAPI
 import threading
 
@@ -101,18 +102,18 @@ latest_result = None # 최근 결과 저장
 def mic_loop():
 global latest_result
 
-    print("Mic streaming started...")
+      print("Mic streaming started...")
 
-    for chunk in mic.stream():
-        try:
-            result = pipeline.process_chunk(chunk)
+      for chunk in mic.stream():
+          try:
+              result = pipeline.process_chunk(chunk)
 
-            if result:
-                latest_result = result
-                print("result:", result)
+              if result:
+                  latest_result = result
+                  print("result:", result)
 
-        except Exception as e:
-            print("❌ error in pipeline:", e)
+          except Exception as e:
+              print("❌ error in pipeline:", e)
 
 @app.on_event("startup")
 def start_mic():
@@ -122,6 +123,7 @@ thread.start()
 @app.get("/latest")
 def get_latest():
 return latest_result
+```
 
 ## 실행 흐름
 
