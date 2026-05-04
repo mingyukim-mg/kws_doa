@@ -2,84 +2,95 @@ import numpy as np
 from collections import deque
 import time
 
-# ===== 외부 모델 =====
-from KWS.kws_infer import predict_from_waveform  # KWS
-from MLPDOA.doa_infer import predict as doa_predict  # DOA
+from KWS.kws_infer import predict_from_waveform
+from MLPDOA.doa_infer import predict as doa_predict
+
 
 class AudioPipeline:
     def __init__(self,
                  chunk_size=0.1,
                  sample_rate=16000,
-                 interval_sec=1.0):
+		 interval_sec=1.0):
 
         self.chunk_size = chunk_size
         self.sample_rate = sample_rate
         self.chunk_len = int(sample_rate * chunk_size)
 
-        # 1초 buffer (10개)
         self.buffer = deque(maxlen=10)
 
-        # interval control
+	# interval control
         self.last_event_time = 0
         self.interval_sec = interval_sec
 
     # =========================
-    # 1. energy 계산
+    # energy
     # =========================
     def compute_energy(self, audio):
         return np.mean(np.abs(audio))
 
     # =========================
-    # 2. arrival feature
+    # arrival
     # =========================
-    def get_arrival_time(self, x, ratio=0.5):
+    def get_arrival_time(self, x):
         x = x - np.mean(x)
         x = np.abs(x)
 
-        max_val = np.max(x)
-        if max_val < 1e-6:
+        if np.max(x) < 1e-6:
             return None
 
-        threshold = max_val * ratio
-
-        for i, v in enumerate(x):
-            if v >= threshold:
-                return i
-        return None
+        # threshold 방식 제거 → peak 사용
+        return np.argmax(x)
 
     def extract_arrival_feature(self, audio_4ch):
         times = []
+
         for ch in audio_4ch:
             t = self.get_arrival_time(ch)
             if t is None:
-                t = 0
+                return None
             times.append(t)
 
-        # normalize
-        times = np.array(times, dtype=np.float32)
-        if np.max(times) > 0:
-            times = times / np.max(times)
+        raw_times = np.array(times, dtype=np.float32)
 
-        return times
+        # relative 변환
+        rel = raw_times - np.min(raw_times)
+
+        return rel
 
     # =========================
-    # 3. chunk 처리
+    # event detection (핵심 추가)
+    # =========================
+    def extract_event_segment(self, audio_4ch):
+        # mono 변환
+        mono = np.mean(audio_4ch, axis=0)
+
+        energy = np.abs(mono)
+
+        # peak 찾기
+        peak_idx = np.argmax(energy)
+
+        # ±20ms window
+        window = int(0.02 * self.sample_rate)
+
+        start = max(0, peak_idx - window)
+        end = min(len(mono), peak_idx + window)
+
+        segment = audio_4ch[:, start:end]
+
+        return segment
+
+    # =========================
+    # main
     # =========================
     def process_chunk(self, audio_4ch):
-        """
-        audio_4ch: (4, T)
-        """
 
         energy = self.compute_energy(audio_4ch)
-        arrival = self.extract_arrival_feature(audio_4ch)
-
+        # buffer에는 audio, energy 저장
         self.buffer.append({
             "audio": audio_4ch,
-            "energy": energy,
-            "arrival": arrival
+            "energy": energy
         })
 
-        # buffer 부족하면 skip
         if len(self.buffer) < 10:
             return None
 
@@ -88,69 +99,196 @@ class AudioPipeline:
         if now - self.last_event_time < self.interval_sec:
             return None
 
-        # =========================
-        # 4. KWS
-        # =========================
-        audio_1s = self.merge_audio()
 
-        kws_result = predict_from_waveform(audio_1s)
+        # =========================
+        # 1초 audio 생성
+        # =========================
+        audio_1s_4ch = self.merge_audio_4ch()
+        audio_1s_mono = np.mean(audio_1s_4ch, axis=0)
+
+        # =========================
+        # KWS
+        # =========================
+        kws_result = predict_from_waveform(audio_1s_mono)
 
         if not kws_result["detected"]:
             return None
 
         if kws_result["label"] == "background":
-            return {
-                "label": "background",
-                "direction": None,
-                "score": kws_result["score"],
-            }
-        # =========================
-        # 5. DOA
-        # =========================
-        chunk = self.select_chunk()
+            return None
 
-        direction = doa_predict(chunk["arrival"])
+
+        # =========================
+        # segment 5개 추출 (center 기준)
+        # =========================
+        segments = self.extract_multi_segments()  
+        # → [S-2, S-1, S0, S+1, S+2]
+
+        directions = []
+
+        for seg in segments:
+            if seg is None:
+                directions.append("Nodir")
+                continue
+
+            rel = self.extract_arrival_feature(seg)
+
+            if rel is None:
+                directions.append("Nodir")
+                continue
+
+            model_input = preprocess_arrival(rel)
+
+            if model_input is None:
+                directions.append("Nodir")
+                continue
+
+            d = doa_predict(model_input)
+            directions.append(d)
+
+
+
+        # =========================
+        # center 판단
+        # =========================
+        center_dir = directions[2]
+
+        # =========================
+        # weight 선택
+        # =========================
+        if center_dir == "Nodir":
+            weights = [1, 3, 0, 3, 1]
+        else:
+            weights = [1, 2, 4, 2, 1]
+
+        # =========================
+        # 벡터 fusion
+        # =========================
+        theta, mag = vector_fusion(directions, weights)
+
+        if theta is None:
+            final_dir = "Nodir"
+        else:
+            final_dir = angle_to_direction(theta)
 
         self.last_event_time = now
-
+        self.buffer.clear()
         return {
             "label": kws_result["label"],
-            "direction": direction,
+            "direction": final_dir,
             "score": kws_result["score"]
         }
 
     # =========================
-    # 4. buffer → 1초 오디오
+    # merge
     # =========================
-    def merge_audio(self):
-        """
-        (4, T) * 10 → (T_total,)
-        mono로 합쳐서 KWS 입력
-        """
-
+    def merge_audio_4ch(self):
         audio = [c["audio"] for c in self.buffer]
-        audio = np.concatenate(audio, axis=1)  # (4, total)
-
-        # mono 변환
-        audio = np.mean(audio, axis=0)
-
+        audio = np.concatenate(audio, axis=1)
         return audio
+    
+    def extract_multi_segments(self):
+        """
+        buffer에서 energy 기준으로 peak를 찾고
+        S-2 ~ S+2 총 5개 segment 반환
+        """
 
-    # =========================
-    # 5. chunk 선택 (핵심)
-    # =========================
-    def select_chunk(self):
-        energies = np.array([c["energy"] for c in self.buffer])
-        mean_E = np.mean(energies)
+        # =========================
+        # 1. energy 배열
+        # =========================
+        energies = [c["energy"] for c in self.buffer]
 
-        # 너무 작은 값 제거
-        valid = [
-            c for c in self.buffer
-            if c["energy"] > 0.4 * mean_E
-        ]
+        # =========================
+        # 2. peak index
+        # =========================
+        peak_idx = int(np.argmax(energies))
 
-        if len(valid) == 0:
-            valid = list(self.buffer)
+        # =========================
+        # 3. segment 수집
+        # =========================
+        segments = []
 
-        # 가장 뒤 chunk
-        return valid[-1]
+        for offset in [-2, -1, 0, 1, 2]:
+            idx = peak_idx + offset
+
+            # 범위 벗어나면 None 처리
+            if idx < 0 or idx >= len(self.buffer):
+                segments.append(None)
+            else:
+                segments.append(self.buffer[idx]["audio"])
+
+        return segments
+
+
+# =========================
+# preprocess
+# =========================
+def preprocess_arrival(rel):
+
+    # 너무 flat → 제거
+    if np.std(rel) < 1:
+        return None
+
+    # 값 범위 제한
+    if np.max(rel) > 50:
+        return None
+
+    # 최소값이 여러 개면 제거
+    if np.sum(rel == 0) >= 2:
+        return None
+
+    return rel.astype(np.float32)
+
+
+
+DIR2DEG = {
+    "R": 0,
+    "FR": 45,
+    "F": 90,
+    "FL": 135,
+    "L": 180,
+    "BL": 225,
+    "B": 270,
+    "BR": 315
+}
+
+def vector_fusion(directions, weights):
+    x_total = 0.0
+    y_total = 0.0
+
+    for d, w in zip(directions, weights):
+        if d is None or d == "Nodir":
+            continue
+
+        theta = np.deg2rad(DIR2DEG[d])
+        x_total += w * np.cos(theta)
+        y_total += w * np.sin(theta)
+
+    mag = np.sqrt(x_total**2 + y_total**2)
+
+    if mag < 1e-3:
+        return None, 0.0
+
+    theta_final = np.rad2deg(np.arctan2(y_total, x_total))
+    if theta_final < 0:
+        theta_final += 360
+
+    return theta_final, mag
+
+def angle_to_direction(theta):
+    bins = [
+        (337.5, 360, "R"),
+        (0, 22.5, "R"),
+        (22.5, 67.5, "FR"),
+        (67.5, 112.5, "F"),
+        (112.5, 157.5, "FL"),
+        (157.5, 202.5, "L"),
+        (202.5, 247.5, "BL"),
+        (247.5, 292.5, "B"),
+        (292.5, 337.5, "BR"),
+    ]
+
+    for low, high, d in bins:
+        if low <= theta < high:
+            return d
+    return "Nodir"
