@@ -3,8 +3,8 @@ from collections import deque
 import time
 
 from KWS.kws_infer import predict_from_waveform
-from MLPDOA.doa_infer import predict as doa_predict
-
+#from MLPDOA.doa_infer import predict as doa_predict
+from kws_doa.gcc_phat import estimate_direction
 
 class AudioPipeline:
     def __init__(self,
@@ -58,7 +58,7 @@ class AudioPipeline:
         return rel
 
     # =========================
-    # event detection (핵심 추가)
+    # event detection
     # =========================
     def extract_event_segment(self, audio_4ch):
         # mono 변환
@@ -99,77 +99,45 @@ class AudioPipeline:
         if now - self.last_event_time < self.interval_sec:
             return None
 
-
+        #t0=time.perf_counter()
         # =========================
         # 1초 audio 생성
         # =========================
         audio_1s_4ch = self.merge_audio_4ch()
+        #t1=time.perf_counter()
         audio_1s_mono = np.mean(audio_1s_4ch, axis=0)
-
+        #t2=time.perf_counter()
         # =========================
         # KWS
         # =========================
         kws_result = predict_from_waveform(audio_1s_mono)
 
-        if not kws_result["detected"]:
-            return None
-
+        #t3=time.perf_counter()
+        # print(f"[PROFILE] "
+        #     f"merge={t1-t0:.4f} "
+        #     f"mono={t2-t1:.4f} "
+        #     f"kws={t3-t2:.4f}"
+        # )
         if kws_result["label"] == "background":
             return None
 
 
-        # =========================
-        # segment 5개 추출 (center 기준)
-        # =========================
-        segments = self.extract_multi_segments()  
-        # → [S-2, S-1, S0, S+1, S+2]
-
-        directions = []
-
-        for seg in segments:
-            if seg is None:
-                directions.append("Nodir")
-                continue
-
-            rel = self.extract_arrival_feature(seg)
-
-            if rel is None:
-                directions.append("Nodir")
-                continue
-
-            model_input = preprocess_arrival(rel)
-
-            if model_input is None:
-                directions.append("Nodir")
-                continue
-
-            d = doa_predict(model_input)
-            directions.append(d)
-
-
 
         # =========================
-        # center 판단
+        # event segment 추출
         # =========================
-        center_dir = directions[2]
+        segment = self.extract_event_segment(audio_1s_4ch)
+
+        # segment 추출 실패
+        if segment is None:
+            return None
 
         # =========================
-        # weight 선택
+        # GCC-PHAT DOA
         # =========================
-        if center_dir == "Nodir":
-            weights = [1, 3, 0, 3, 1]
-        else:
-            weights = [1, 2, 4, 2, 1]
+        doa_result = estimate_direction(segment)
 
-        # =========================
-        # 벡터 fusion
-        # =========================
-        theta, mag = vector_fusion(directions, weights)
-
-        if theta is None:
-            final_dir = "Nodir"
-        else:
-            final_dir = angle_to_direction(theta)
+        final_dir = doa_result["direction"]
 
         self.last_event_time = now
         self.buffer.clear()
